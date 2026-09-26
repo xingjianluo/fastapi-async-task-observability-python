@@ -7,7 +7,7 @@ import enum
 import time
 
 from .errors import AppError, InvalidStateTransition
-from .statemachine import TaskStatus, is_legal_transition
+from .statemachine import TERMINAL_STATES, TaskStatus, is_legal_transition
 
 
 @dataclasses.dataclass
@@ -43,7 +43,16 @@ class TaskStore:
         self._by_key: dict[str, str] = {}
 
     async def submit(self, record: TaskRecord) -> tuple[TaskRecord, DuplicateSubmitOutcome]:
-        raise NotImplementedError
+        """幂等提交：同一幂等键只创建一次记录，重复提交返回既有记录。"""
+        async with self._lock:
+            existing_id = self._by_key.get(record.idempotency_key)
+            if existing_id is not None:
+                return self._by_id[existing_id], DuplicateSubmitOutcome.DUPLICATE
+            now = time.monotonic()
+            record.created_at = record.updated_at = now
+            self._by_id[record.task_id] = record
+            self._by_key[record.idempotency_key] = record.task_id
+            return record, DuplicateSubmitOutcome.CREATED
 
     async def transition(
         self,
@@ -53,13 +62,47 @@ class TaskStore:
         result: dict | None = None,
         error: AppError | None = None,
     ) -> TaskRecord:
-        raise NotImplementedError
+        """状态迁移：非法迁移明确拒绝并携带可区分的原因。"""
+        async with self._lock:
+            record = self._by_id.get(task_id)
+            if record is None:
+                raise InvalidStateTransition(
+                    f"task {task_id} not found",
+                    current="<missing>",
+                    target=target.value,
+                    reason="transition rejected: task does not exist",
+                )
+            if not is_legal_transition(record.status, target):
+                raise InvalidStateTransition(
+                    f"illegal transition {record.status.value} -> {target.value}",
+                    current=record.status.value,
+                    target=target.value,
+                    reason=(
+                        "transition rejected: terminal state"
+                        if record.status in TERMINAL_STATES
+                        else "transition rejected: not in allowed set"
+                    ),
+                )
+            record.status = target
+            record.updated_at = time.monotonic()
+            if target is TaskStatus.RUNNING:
+                record.started_at = record.updated_at
+                record.attempt += 1
+            if target in TERMINAL_STATES:
+                record.finished_at = record.updated_at
+                record.result = result
+                record.error = error.to_dict() if error else None
+            return record
 
     async def get(self, task_id: str) -> TaskRecord | None:
-        raise NotImplementedError
+        async with self._lock:
+            return self._by_id.get(task_id)
 
     async def get_by_key(self, idempotency_key: str) -> TaskRecord | None:
-        raise NotImplementedError
+        async with self._lock:
+            task_id = self._by_key.get(idempotency_key)
+            return self._by_id.get(task_id) if task_id else None
 
     async def all_records(self) -> list[TaskRecord]:
-        raise NotImplementedError
+        async with self._lock:
+            return list(self._by_id.values())
