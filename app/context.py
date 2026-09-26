@@ -38,4 +38,8 @@ def reset_task_id(token: contextvars.Token) -> None:
 
 def ensure_correlation_id() -> str:
     """若当前无关联标识则生成一个，返回当前标识。"""
-    raise NotImplementedError
+    current = _correlation_id.get()
+    if not current:
+        current = new_correlation_id()
+        _correlation_id.set(current)
+    return current

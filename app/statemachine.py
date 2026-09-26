@@ -30,4 +30,4 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
 
 
 def is_legal_transition(current: TaskStatus, target: TaskStatus) -> bool:
-    raise NotImplementedError
+    return target in ALLOWED_TRANSITIONS[current]

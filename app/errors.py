@@ -74,5 +74,29 @@ class TaskTimeout(AppError):
 
 
 def normalize_exception(exc: BaseException) -> AppError:
-    """把底层异常归一化为 AppError；不透出原始异常，不静默吞掉。"""
-    raise NotImplementedError
+    """把底层异常归一化为 AppError；不透出原始异常，不静默吞掉。
+
+    归一化规则（判定依据写入 reason 字段）：
+    - 已是 AppError：原样返回；
+    - asyncio.TimeoutError / TimeoutError：归为 DOWNSTREAM_TIMEOUT；
+    - asyncio.CancelledError：归为 TASK_CANCELLED；
+    - 其余异常：归为 INTERNAL_ERROR，底层类型名写入 reason，不携带原始堆栈。
+    """
+    import asyncio
+
+    if isinstance(exc, AppError):
+        return exc
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return DownstreamTimeout(
+            "downstream call timed out",
+            reason=f"normalized from {type(exc).__name__}",
+        )
+    if isinstance(exc, asyncio.CancelledError):
+        return TaskCancelled(
+            "operation was cancelled",
+            reason=f"normalized from {type(exc).__name__}",
+        )
+    return AppError(
+        "internal error",
+        reason=f"normalized from {type(exc).__name__}: {exc}",
+    )
