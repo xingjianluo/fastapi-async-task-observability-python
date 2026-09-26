@@ -98,6 +98,16 @@ class TaskStore:
         async with self._lock:
             return self._by_id.get(task_id)
 
+    async def discard_pending(self, task_id: str) -> bool:
+        """回滚：仅允许删除仍处于 PENDING 的记录（如背压拒绝后清理占位）。"""
+        async with self._lock:
+            record = self._by_id.get(task_id)
+            if record is None or record.status is not TaskStatus.PENDING:
+                return False
+            del self._by_id[task_id]
+            self._by_key.pop(record.idempotency_key, None)
+            return True
+
     async def get_by_key(self, idempotency_key: str) -> TaskRecord | None:
         async with self._lock:
             task_id = self._by_key.get(idempotency_key)

@@ -98,6 +98,15 @@ class TaskExecutor:
     def inflight_count(self) -> int:
         return len(self._inflight)
 
+    async def cancel(self, task_id: str) -> bool:
+        """取消在途任务（排队或运行中）。返回是否命中了在途任务。"""
+        task = self._inflight.get(task_id)
+        if task is None:
+            return False
+        task.cancel()
+        self._log.info("cancel requested", extra={"obs_task_id": task_id})
+        return True
+
     async def _run(self, task_id: str) -> None:
         token = set_task_id(task_id)
         try:
