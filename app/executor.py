@@ -128,7 +128,7 @@ class TaskExecutor:
             try:
                 record = await self._store.get(task_id)
                 try:
-                    await self._store.transition(task_id, TaskStatus.RUNNING)
+                    record = await self._store.transition(task_id, TaskStatus.RUNNING)
                 except InvalidStateTransition as exc:
                     # 排队期间已被取消/迁移：不执行，避免半完成结果与重复副作用
                     self._log.info(
@@ -136,7 +136,7 @@ class TaskExecutor:
                         extra={"obs_reason": exc.reason},
                     )
                     return
-                self._log.info("task running", extra={"obs_attempt": record.attempt + 1})
+                self._log.info("task running", extra={"obs_attempt": record.attempt})
                 try:
                     async with asyncio.timeout(self._config.task_timeout):
                         result = await self._downstream.fan_out(record.payload)
