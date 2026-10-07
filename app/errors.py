@@ -12,6 +12,7 @@ class ErrorCategory(str, enum.Enum):
     CAPACITY_EXCEEDED = "capacity_exceeded"
     INVALID_STATE_TRANSITION = "invalid_state_transition"
     TASK_NOT_FOUND = "task_not_found"
+    TASK_NOT_RELEASABLE = "task_not_releasable"
     TASK_CANCELLED = "task_cancelled"
     TASK_TIMEOUT = "task_timeout"
     INTERNAL_ERROR = "internal_error"
@@ -63,6 +64,21 @@ class InvalidStateTransition(AppError):
 
 class TaskNotFound(AppError):
     category = ErrorCategory.TASK_NOT_FOUND
+
+
+class TaskNotReleasable(AppError):
+    """手动释放被拒绝：目标存在但尚未进入终态。"""
+
+    category = ErrorCategory.TASK_NOT_RELEASABLE
+
+    def __init__(self, message: str, *, current: str, reason: str = "") -> None:
+        super().__init__(message, reason=reason)
+        self.current = current
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d.update({"current": self.current})
+        return d
 
 
 class TaskCancelled(AppError):

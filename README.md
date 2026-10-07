@@ -42,7 +42,8 @@ PENDING ──> RUNNING ──> SUCCEEDED        (终态)
 | `task_cancelled` | 主动取消 / 停机中断 | — |
 | `capacity_exceeded` | 排队满 / 停机中提交 | 429 |
 | `invalid_state_transition` | 非法状态迁移 | 409 |
-| `task_not_found` | 任务不存在 | 404 |
+| `task_not_found` | 任务不存在（含手动释放目标缺失） | 404 |
+| `task_not_releasable` | 手动释放未终态任务 | 409 |
 | `internal_error` | 未预期异常（含类型名，不含堆栈） | 500 |
 
 ## 4. 容量背压与优雅停机
@@ -53,13 +54,37 @@ PENDING ──> RUNNING ──> SUCCEEDED        (终态)
 - 停机 `shutdown()`：先标记不再接收新任务 → `asyncio.wait` 宽限 `shutdown_grace` 秒 → 未收尾任务统一 `cancel()` 并等待它们进入 `CANCELLED` 终态 → 清空在途表。在途任务不重复执行、不泄漏后台任务。
 - 任务执行受 `task_timeout` 约束（`asyncio.timeout`），超时进入 `TIMED_OUT`，失败原因可一致地清理和观测。
 
-## 5. 可观测性
+## 5. 保留、回收与幂等键复用
+
+终态任务不会无限堆积。`TaskReaper`（`app/retention.py`）在后台按 `sweep_interval` 周期扫描 `TaskStore`，每轮做两件事：
+
+1. **到期回收**：`finished_at` 距当前时间 ≥ `retention_seconds` 的终态任务被移除（记录与幂等键映射一起删除）；
+2. **容量淘汰**：终态历史总量超过 `max_history` 时，按 `finished_at` **最旧优先**淘汰，直到回到上限以内。
+
+规则与边界：
+
+- 在途任务（`PENDING/RUNNING`）没有 `finished_at`，任何情况下都不会被回收；未到期的终态任务同样保留。
+- **幂等键语义以回收为界**：保留期内同键重复提交仍命中同一任务（`created=false`，不重复执行）；任务被回收（或手动释放）后，同一键再次提交视为全新任务，重新执行并产生新的业务结果。
+- 回收与提交并发时，两者在存储的同一把锁下串行化：要么提交先命中旧记录（随后被回收、键释放），要么回收先完成（随后提交创建全新任务），不会出现键与记录不一致的中间态。
+- 可观测性：`GET /retention/stats` 暴露 `total_reclaimed`（累计回收数）、`last_reclaim_at`（最近一次回收的墙钟时间）、`sweep_count`（扫描轮次）。每轮回收生成独立关联标识，每条被回收记录输出 `task reclaimed` 日志，携带 `task_id`、`idempotency_key`、`status`、`finished_at` 与判定依据（`exceeded retention_seconds` / `history exceeded max_history, oldest first`），可按关联标识核对一轮回收的完整决策链。
+
+## 6. 查询与手动释放
+
+- `GET /tasks?status=&created_from=&created_to=&limit=&offset=`：按状态与创建时间范围（墙钟秒）筛选并分页，返回 `tasks`（按创建时间升序）、`total`（符合条件的总量，与分页无关）、`limit`、`offset`。`status` 非法返回 422；`limit` 范围 1–200。
+- `POST /tasks/{task_id}/release`：手动释放终态任务占用的幂等键并移除记录，之后同键提交得到全新任务。处理结果可区分：
+  - 终态：200，`{"released": true, ...}`；
+  - 未终态（在途）：409，`category=task_not_releasable`，`current` 给出当前状态，键仍被占用；
+  - 不存在：404，`category=task_not_found`。
+  
+  对外响应只含稳定类别与原因，不带内部实现细节；判定依据以 `obs_*` 日志留痕（如 `task released` 日志携带键与状态）。
+
+## 7. 可观测性
 
 - 每条日志为单行 JSON，字段包含 `correlation_id`、`task_id`、`level`、`msg`，业务判定依据以 `obs_*` 前缀的 extra 传入（输出时去掉前缀），如 `obs_reason`、`obs_category`。
 - HTTP 中间件优先复用 `X-Correlation-Id` 请求头，没有则生成，并在响应头回写；该 ID 写入任务记录，贯穿异步任务与并发子操作。
 - 任务状态与错误保存在进程内 `TaskStore`，可通过 `GET /tasks/{id}`、`GET /tasks/by-key/{key}` 验证终态与归一化错误。
 
-## 6. 关键配置项
+## 8. 关键配置项
 
 `ExecutorConfig`（`app/executor.py`）与 `DownstreamClient`（`app/downstream.py`）：
 
@@ -73,7 +98,15 @@ PENDING ──> RUNNING ──> SUCCEEDED        (终态)
 | `DownstreamClient.fail_mode` | None | `error` / `hang` 模拟下游失败与挂起 |
 | `DownstreamClient.fanout` | 2 | 每任务的并发子操作数 |
 
-## 7. 本地验证方法
+`RetentionConfig`（`app/retention.py`）：
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `retention_seconds` | 3600.0s | 终态任务保留时长，超过即被回收 |
+| `max_history` | 10000 | 终态历史总量上限，超出按最旧优先淘汰 |
+| `sweep_interval` | 60.0s | 后台回收扫描间隔 |
+
+## 9. 本地验证方法
 
 ```bash
 # 安装依赖（uv 已在 pyproject 中配置镜像）
@@ -104,9 +137,24 @@ curl -s -X POST localhost:PORT/tasks \
 
 # 查询终态与归一化错误
 curl -s localhost:PORT/tasks/<task_id>
+
+# 分页查询（按状态过滤）
+curl -s 'localhost:PORT/tasks?status=succeeded&limit=10'
+
+# 手动释放终态任务的幂等键（之后同键可重新提交为新任务）
+curl -s -X POST localhost:PORT/tasks/<task_id>/release
+
+# 回收指标：累计回收数 / 最近回收时间 / 扫描轮次
+curl -s localhost:PORT/retention/stats
 ```
 
-## 8. 模块结构
+本地复现回收行为：把 `main.py` 中 `RetentionConfig` 调小（如
+`retention_seconds=5, sweep_interval=2`），提交任务待其进入终态，
+5 秒后观察日志中的 `task reclaimed`（含判定依据）与
+`GET /retention/stats` 的 `total_reclaimed` 增长；随后用同一幂等键
+重新提交，应返回 201 与全新 `task_id`。
+
+## 10. 模块结构
 
 | 模块 | 职责 |
 |---|---|
@@ -114,8 +162,9 @@ curl -s localhost:PORT/tasks/<task_id>
 | `app/logging_config.py` | 结构化 JSON 日志与上下文注入 |
 | `app/errors.py` | 错误类别定义与异常归一化 |
 | `app/statemachine.py` | 合法迁移规则 |
-| `app/store.py` | 幂等提交、状态迁移、占位回滚 |
+| `app/store.py` | 幂等提交、状态迁移、占位回滚、回收/释放/查询 |
 | `app/downstream.py` | 模拟下游与并发子操作 |
 | `app/executor.py` | 背压、超时、优雅停机 |
+| `app/retention.py` | 终态保留期回收、历史容量淘汰、回收指标 |
 | `app/service.py` | 提交/查询/取消门面 |
 | `app/api.py` | 中间件、错误响应映射、路由 |

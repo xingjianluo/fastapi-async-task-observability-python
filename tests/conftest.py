@@ -42,8 +42,9 @@ async def make_service():
         max_pending: int = 8,
         task_timeout: float = 2.0,
         shutdown_grace: float = 1.0,
+        clock=None,
     ) -> TaskService:
-        store = TaskStore()
+        store = TaskStore(clock) if clock is not None else TaskStore()
         downstream = DownstreamClient(
             latency=latency, timeout=timeout, fail_mode=fail_mode, fanout=fanout
         )

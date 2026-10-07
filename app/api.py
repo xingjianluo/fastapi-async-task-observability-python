@@ -1,7 +1,7 @@
 """HTTP API：关联标识中间件、错误归一化响应、任务路由。"""
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -15,11 +15,14 @@ from .errors import (
     normalize_exception,
 )
 from .logging_config import get_logger
+from .retention import TaskReaper
 from .service import TaskService
+from .statemachine import TaskStatus
 
 _STATUS_BY_CATEGORY = {
     ErrorCategory.CAPACITY_EXCEEDED: 429,
     ErrorCategory.INVALID_STATE_TRANSITION: 409,
+    ErrorCategory.TASK_NOT_RELEASABLE: 409,
     ErrorCategory.TASK_NOT_FOUND: 404,
     ErrorCategory.DOWNSTREAM_ERROR: 502,
     ErrorCategory.DOWNSTREAM_TIMEOUT: 504,
@@ -31,7 +34,7 @@ class SubmitRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
-def create_app(service: TaskService) -> FastAPI:
+def create_app(service: TaskService, reaper: TaskReaper | None = None) -> FastAPI:
     app = FastAPI()
     log = get_logger("api")
 
@@ -87,5 +90,45 @@ def create_app(service: TaskService) -> FastAPI:
     @app.post("/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str) -> dict:
         return {"task": (await service.cancel(task_id)).to_dict()}
+
+    @app.get("/tasks")
+    async def list_tasks(
+        status: TaskStatus | None = None,
+        created_from: float | None = Query(default=None),
+        created_to: float | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        """按状态与创建时间范围（墙钟秒）分页查询已提交任务。"""
+        records, total = await service.list_tasks(
+            status=status,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "tasks": [r.to_dict() for r in records],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.post("/tasks/{task_id}/release")
+    async def release_task(task_id: str) -> dict:
+        """手动释放终态任务占用的幂等键；未终态 409、不存在 404。"""
+        record = await service.release(task_id)
+        return {
+            "released": True,
+            "task_id": record.task_id,
+            "idempotency_key": record.idempotency_key,
+        }
+
+    @app.get("/retention/stats")
+    async def retention_stats() -> dict:
+        """回收可观测指标：累计回收数、最近回收时间、扫描轮次。"""
+        if reaper is None:
+            return {"enabled": False}
+        return {"enabled": True, **reaper.stats().to_dict()}
 
     return app

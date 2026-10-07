@@ -89,3 +89,39 @@ class TaskService:
             extra={"obs_task_id": task_id, "obs_from": "running_or_pending"},
         )
         return record
+
+    async def list_tasks(
+        self,
+        *,
+        status: TaskStatus | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[TaskRecord], int]:
+        """按状态与创建时间范围分页查询已提交任务。"""
+        return await self._store.query(
+            status=status,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def release(self, task_id: str) -> TaskRecord:
+        """手动释放终态任务占用的幂等键。
+
+        仅允许终态任务；不存在 / 未终态分别抛出 TaskNotFound /
+        TaskNotReleasable，对外只暴露稳定类别与原因，判定依据留痕于日志。
+        """
+        record = await self._store.release(task_id)
+        self._log.info(
+            "task released",
+            extra={
+                "obs_task_id": task_id,
+                "obs_idempotency_key": record.idempotency_key,
+                "obs_status": record.status.value,
+                "obs_reason": "manual release of terminal task, idempotency key freed",
+            },
+        )
+        return record
