@@ -1,4 +1,4 @@
-"""服务入口：装配存储、执行器、服务与 API，并接入优雅停机。"""
+"""服务入口：装配存储、执行器、回收器、服务与 API，并接入优雅停机。"""
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -8,6 +8,7 @@ from app.api import create_app
 from app.downstream import DownstreamClient
 from app.executor import ExecutorConfig, TaskExecutor
 from app.logging_config import configure_logging, get_logger
+from app.retention import RetentionConfig, RetentionSweeper
 from app.service import TaskService
 from app.store import TaskStore
 
@@ -17,13 +18,16 @@ log = get_logger("main")
 store = TaskStore()
 downstream = DownstreamClient(latency=0.05, timeout=2.0, fanout=2)
 executor = TaskExecutor(store, downstream, ExecutorConfig())
-service = TaskService(store, executor)
+sweeper = RetentionSweeper(store, RetentionConfig())
+service = TaskService(store, executor, sweeper)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    sweeper.start()
     log.info("service started")
     yield
+    await sweeper.stop()
     await executor.shutdown()
     log.info("service stopped")
 
